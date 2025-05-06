@@ -1,0 +1,536 @@
+import os
+import csv
+import uuid
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import quad
+from scipy.optimize import minimize
+from matplotlib.gridspec import GridSpec
+import matplotlib
+
+matplotlib.use('TkAgg')
+
+class TrajectoryOptimizer:
+    '''
+    Vehicle trajectory will be adjusted using a fifth-degree polynomial
+    '''
+
+    def __init__(self,ego_state,lead_state,T,D_0,tau):
+
+        self.s0,self.v0,self.ac0=ego_state
+        self.s_lv0,self.v_lv,self.ac_vl = lead_state
+        self.T=T
+        self.D_0=D_0
+        self.tau=tau
+
+
+        # Target Position
+        self.s_lv_T = self.s_lv0+self.v_lv*self.T
+        self.s_target = self.s_lv_T - (self.D_0+self.tau*self.v_lv)  # [7]
+
+
+    def generate_trajectory(self,a,t):
+        '''
+        To compute the trajectory, use a 5th-degree equation:
+        trajectory = f(x)                               '''
+        return sum(a[i]*t**i for i in range(6))
+
+    def generate_velocity(self,a,t):
+        '''
+        Compute the velocity of the vehicles
+        f'(x)                      '''
+        return a[1] + 2*a[2]*t + 3*a[3]*t**2 + 4*a[4]*t**3 + 5*a[5]*t**4
+
+    def generate_acceleration(self,a,t):
+        ''' Compute the acceleration of the vehicles
+            f''(X)                       '''
+        return 2*a[2] + 6*a[3]*t + 12*a[4]*t**2 + 20*a[5]*t**3
+
+    def generate_jerk(self,a,t):
+        """
+        Derivative of acceleration measures ride comfort (jerk)
+        f'''(x)
+        """
+        return 6*a[3] + 24*a[4]*t + 60*a[5]*t**2
+
+    def jerk_squared_integral(self,a,t0,t1):    # [9]
+        '''
+        Jerk karesi integralini hesapla
+        '''
+        jerk_func = lambda t:(6 * a[3] + 24 * a[4] * t + 60 * a[5] * t**2)**2
+        return quad(jerk_func,t0,t1)[0]  # quad (result,error)
+
+
+    def cost_function(self,a_free,k_j,k_t,k_s):
+        '''
+
+        trajectory = a0 +a1*t +a2*t^2 +..+ a5*t^5      t=0  f(x)=a0      a0  = s0
+        velocity = a1+ 2a2*t + 3a3*t^2 +..+ 5a5*t^4    t=0  f(x)=a1      a1  = v0
+        acceleration  2a2 + 6a3*t + ..+ 20a5*t^3       t=0  f(x)=2a2     2a2 = ac0    a2 = ac0/2
+        jerk =   6a3 + 24a4*t+ 60a5*t^2                t=0  f(x)=6a3
+
+       # Compute the integral of squared jerk
+        k_j = Importance given to jerk
+        k_t = Importance given to minimizing time
+        k_s = Importance given to reaching the target position
+
+        Compute the cost function C     [8]
+        '''
+
+        # # Constant coefficients and initial estimates
+
+        a_full =[self.s0,self.v0,self.ac0/2]+list(a_free)  #  [6] Trajectory generation
+
+        # Jerk cost
+
+        jerk_cost = self.jerk_squared_integral(a_full,0,self.T)   # jerk_cost = quad( f''(t)**2)
+
+        # Penalize jerk to avoid sharp changes
+
+        t_samples = np.linspace(0,self.T,20)
+        jerk_values = self.generate_jerk(a_full,t_samples)
+        max_jerk_penalty = np.max(np.abs(jerk_values))**2 # The maximum absolute jerk value during early iterations is very large (around 10,000),
+        # but it decreases to around 0.5 after optimization
+        total_jerk_cost = jerk_cost + max_jerk_penalty*0.1  # I included the impact of penalization together with a rate factor, based on the output values I observed
+
+        # Time Cost
+
+        velocities = self.generate_velocity(a_full,t_samples)
+
+        # Deviation from the desired speed
+        desired_speed = self.v_lv # The lead vehicle's speed is used as the target; it could potentially be updated to maintain a safe following distance
+        speed_deviation = np.mean((velocities - desired_speed)**2)
+
+        # Acceleration cost to encourage smoother speed transitions
+        accelerations = self.generate_acceleration(a_full,t_samples)
+        accel_cost = np.mean(accelerations**2) # Starts around 12,000, suddenly drops from 4,000 to 14 — needs investigation??
+
+        # Total Time Cost
+        time_efficiency_cost = speed_deviation + accel_cost *0.1  # A smaller rate can be assigned compared to jerk
+
+        # Position error cost
+        # Final Position
+        s_T = self.generate_trajectory(a_full,self.T)
+
+        # Position error with respect to the target
+        position_error = (s_T - self.s_target)**2
+
+        # Distance between the lead and ego vehicles
+        lead_pos = self.s_lv0 + self.v_lv*t_samples  # Moving with constant acceleration
+        ego_pos = self.generate_trajectory(a_full,t_samples)
+        distances = lead_pos - ego_pos
+
+        # Required distance for safe following
+        safe_distances = self.D_0+self.tau*self.generate_velocity(a_full,t_samples)
+
+        # Penalization for violating the safe distance
+        safety_violations = np.maximum(0,safe_distances-distances)
+        safety_cost = np.sum(safety_violations**2)
+        position_error_weight = 0.5
+        safety_weight = 0.1
+        # Combined Position Cost
+        print(f"Position error: {position_error},safety_violations: {np.sum(safety_violations)}")
+        total_position_cost = position_error_weight * position_error + safety_weight * np.sum(safety_violations**2)
+
+        # SCALING  - make costs comparable
+        # Use scaling that makes effects of different parameter values more visible
+        norm_jerk_cost = total_jerk_cost /1.0
+        norm_time_cost = time_efficiency_cost/2.0
+        norm_position_cost = total_position_cost/1000.0
+
+        # Total Weighted Cost
+
+        total_cost = k_j*norm_jerk_cost+k_t*norm_time_cost+k_s*norm_position_cost  # Total cost function  [8]
+
+        # Handling numerical issues
+        if np.isnan(total_cost) or np.isinf(total_cost):
+            print(f"Warning : Invalid cosr value detected in guessing. a_free =  {a_free}")
+            total_cost = 1e4
+
+        # Return total cost and individual component costs for analysis
+        return total_cost, k_j * norm_jerk_cost, k_t * norm_time_cost, k_s * norm_position_cost
+
+
+    def optimize_trajectory(self,k_j,k_t,k_s,initial_guess=None):
+        '''
+        Find optimal trajectory coefficient by minimizing the cost function
+        '''
+        if initial_guess is None:
+            target_speed = self.s_target
+            initial_s = self.s0
+            initial_v = self.v0
+            initial_ac = self.ac0
+
+            s_estimate = initial_s + (initial_v*self.T) + 0.5*(initial_ac*self.T**2)
+            delta_s = self.s_target - s_estimate
+            a3_init= (delta_s/self.T**3)*3
+            a4_init = (delta_s*self.T**4)*-4
+            a5_init = (delta_s*self.T**5)*-1
+            initial_guess = [a3_init,a4_init,a5_init]
+
+
+        def objective(a_free):
+            return self.cost_function(a_free,k_j,k_t,k_s)[0]
+
+        # Trying multiple optimization methods and starting points if needed
+        # Setup to track the best optimization result
+        best_result = None
+        best_cost = float('inf')
+
+        # Trying different optimization methods
+        '''
+        Optimization Methods:
+        - BFGS: A quasi-Newton method using gradient approximations for smooth problems.
+        - Nelder-Mead: A derivative-free method based on simplex search. Good for noisy or non-smooth objectives.
+        - Powell: A derivative-free method that performs directional line searches. Reliable for small-dimensional problems.
+        - SLSQP (fallback): Supports constraints and bounds; used if others fail.
+        '''
+        methods = ["BFGS","Nelder-Mead","Powell"]
+        os.makedirs("opt_logs",exist_ok=True)
+
+        for method in methods:
+            cost_history=[]
+
+            def callback(xk):
+                cost_history.append(xk.copy())
+
+            try:
+                # Add small random noise to initial guess to explore other local minimum points
+                jittered_guess = [x+np.random.uniform(-0.1,0.1) for x in initial_guess]
+
+                result = minimize(
+                    lambda x: self.cost_function(x,k_j,k_t,k_s)[0],
+                    jittered_guess,
+                    method=method,
+                    callback=callback,
+                    options={"maxiter": 100}
+                )
+
+                with open(f"opt_logs/{method}_{k_j}_{k_t}_{k_s}_{uuid.uuid4().hex[:6]}.csv","w") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["iteration", "total_cost", "jerk_cost", "time_cost", "position_cost"])
+                    for i, xk in enumerate(cost_history):
+                        total, jerk, time, pos = self.cost_function(xk, k_j, k_t, k_s)
+                        writer.writerow([i, total, jerk, time, pos])
+
+
+                current_cost = objective(result.x)
+                if current_cost < best_cost:
+                    best_cost = current_cost
+                    best_result = result
+                    best_method = method
+
+            except Exception as e:
+                print(f"Optimization with {method} Failed: 1{e}")
+
+
+        if best_result is None:
+            def fallback_callback(xk):
+                cost_history.append(xk.copy())
+
+            cost_history=[]
+            best_method = 'SLSQP'
+            best_result = minimize(
+                    lambda x: self.cost_function(x, k_j, k_t, k_s)[0],
+                    initial_guess,
+                    callback=fallback_callback,
+                    method=best_method)
+            with open(f"opt_logs/{best_method}_kJ{k_j}_kT{k_t}_kS{k_s}_{uuid.uuid4().hex[:6]}.csv", "w", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["iteration", "total_cost", "jerk_cost", "time_cost", "position_cost"])
+                for i, a_free in enumerate(cost_history):
+                    total, jerk, time, pos = self.cost_function(a_free, k_j, k_t, k_s)
+                    writer.writerow([i, total, jerk, time, pos])
+
+
+        a_full = [self.s0,self.v0,self.ac0/2]+ list(best_result.x)
+        total_cost,jerk_cost,time_cost,position_cost = self.cost_function(best_result.x,k_j,k_t,k_s)
+        print(f"Optimized with {k_j=}, {k_t=}, {k_s=}")
+        print(f"Coefficients: a = {[round(a, 4) for a in a_full]}")
+        print(f"Costs - Total: {total_cost:.4f}, Jerk: {jerk_cost:.4f}, Time: {time_cost:.4f}, Position: {position_cost:.4f}")
+
+        return a_full,total_cost,jerk_cost,time_cost,position_cost
+
+
+    def evaluate_trajectory(self,a_full,t_values,method_name = None):
+        '''
+        Evaluate trajectory characeristic for analysis and safety checks
+        '''
+        position = self.generate_trajectory(a_full, t_values)
+        velocity = self.generate_velocity(a_full, t_values)
+        acceleration = self.generate_acceleration(a_full, t_values)
+        jerk = self.generate_jerk(a_full, t_values)
+
+        s_T = position[-1]
+        v_T = velocity[-1]
+        ac_T = acceleration[-1]
+
+        rms_jerk = np.sqrt(np.mean(jerk**2))
+        lead_pos = self.s_lv0 + self.v_lv* t_values
+        distances = lead_pos - position
+        min_distance = np.min(distances)
+
+        required_distance = self.D_0+ self.tau*velocity
+        is_safe_vector = distances >= required_distance
+        is_safe = np.all(is_safe_vector)
+
+        return {
+        'method': method_name,
+        'position': position,
+        'velocity': velocity,
+        'acceleration': acceleration,
+        'jerk': jerk,
+        's_T': s_T,
+        'v_T': v_T,
+        'ac_T': ac_T,
+        'target_error': s_T - self.s_target,
+        'rms_jerk': rms_jerk,
+        'min_distance': min_distance,
+        'is_safe': is_safe,
+        'is_safe_vector': is_safe_vector,
+        'distances': distances,
+        'required_distance': required_distance
+        }
+
+
+def plot_trajectory_comparison(results, t_values, label_key="param", title_prefix="", target_pos=None, lead_pos=None):
+    '''
+    Plot comparison of different trajectories
+    results = [(parameter_value, a_opt, eval_data, jerk_cost, time_cost, position_cost), ...]
+    '''
+    plt.figure(figsize=(18, 14))
+    gs = GridSpec(3, 2, figure=plt.gcf(), height_ratios=[1, 1, 0.8])
+
+    # Use different colors for better distinction
+    colors = ['blue', 'green', 'red', 'purple', 'orange', 'cyan', 'magenta', 'brown', 'pink']
+
+    # Create labels with parameter values
+    labels = [f"{label_key}={val:.1f}" for val, *_ in results]
+
+    # Position plot
+    ax1 = plt.subplot(gs[0, 0])
+
+    # Plot lead vehicle trajectory
+    if lead_pos is not None:
+        ax1.plot(t_values, lead_pos, 'k--', linewidth=2, label="Lead Vehicle")
+
+    # Plot target position line
+    if target_pos is not None:
+        ax1.axhline(y=target_pos, color="r", linestyle="--", linewidth=2, label="Target Position")
+
+    # Plot each optimized trajectory with distinct line styles
+    for i, ((label_val, _, eval_data, *_), lbl) in enumerate(zip(results, labels)):
+        ax1.plot(t_values, eval_data['position'], color=colors[i % len(colors)],
+                 linewidth=2, label=lbl)
+
+    ax1.set_title(f"{title_prefix} - Position Profiles", fontsize=14)
+    ax1.set_xlabel("Time (s)", fontsize=10)
+    ax1.set_ylabel("Position (m)", fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=10)
+
+    # Velocity plot
+    ax2 = plt.subplot(gs[0, 1])
+
+    # Plot lead vehicle velocity
+    ax2.axhline(y=results[0][2]['velocity'][0], color='gray', linestyle=':', label="Initial Velocity")
+
+    # Plot lead vehicle velocity as reference
+    if lead_pos is not None:
+        lead_vel = np.gradient(lead_pos, t_values)
+        ax2.axhline(y=lead_vel[0], color='k', linestyle='--', label="Lead Vehicle Velocity")
+
+    # Plot each optimized velocity profile
+    for i, ((_, _, eval_data, *_), lbl) in enumerate(zip(results, labels)):
+        ax2.plot(t_values, eval_data['velocity'], color=colors[i % len(colors)],
+                 linewidth=2, label=lbl)
+
+    ax2.set_title(f"{title_prefix} - Velocity Profiles", fontsize=10)
+    ax2.set_xlabel("Time (s)", fontsize=10)
+    ax2.set_ylabel("Velocity (m/s)", fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=10)
+
+    # Acceleration plot
+    ax3 = plt.subplot(gs[1, 0])
+
+    # Add zero acceleration reference line
+    ax3.axhline(y=0, color='gray', linestyle=':', label="Zero Acceleration")
+
+    for i, ((_, _, eval_data, *_), lbl) in enumerate(zip(results, labels)):
+        ax3.plot(t_values, eval_data['acceleration'], color=colors[i % len(colors)],
+                 linewidth=2, label=lbl)
+
+    ax3.set_title(f"{title_prefix} - Acceleration Profiles", fontsize=10)
+    ax3.set_xlabel("Time (s)", fontsize=10)
+    ax3.set_ylabel("Acceleration (m/s²)", fontsize=10)
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(fontsize=10)
+
+    # Jerk plot
+    ax4 = plt.subplot(gs[1, 1])
+
+    # Add zero jerk reference line
+    ax4.axhline(y=0, color='gray', linestyle=':', label="Zero Jerk")
+
+    for i, ((_, _, eval_data, *_), lbl) in enumerate(zip(results, labels)):
+        ax4.plot(t_values, eval_data['jerk'], color=colors[i % len(colors)],
+                 linewidth=2, label=lbl)
+
+    ax4.set_title(f"{title_prefix} - Jerk Profiles", fontsize=10)
+    ax4.set_xlabel("Time (s)", fontsize=10)
+    ax4.set_ylabel("Jerk (m/s³)", fontsize=10)
+    ax4.grid(True, alpha=0.3)
+    ax4.legend(fontsize=10)
+
+    # Cost components plot - use log scale for better comparison
+    ax5 = plt.subplot(gs[2, 0])
+
+    # Extract cost components
+    x = np.arange(len(labels))
+    width = 0.25
+
+    jerk_costs = np.array([jc for *_, jc, _, _ in results])
+    time_costs = np.array([tc for *_, _, tc, _ in results])
+    pos_costs = np.array([pc for *_, _, _, pc in results])
+
+    # Ensure positive values for log scale
+    jerk_costs = np.maximum(jerk_costs, 1e-10)
+    time_costs = np.maximum(time_costs, 1e-10)
+    pos_costs = np.maximum(pos_costs, 1e-10)
+
+    # Create stacked bars for better visualization
+    ax5.bar(x, jerk_costs, width, label='Jerk Cost', color='skyblue')
+    ax5.bar(x, time_costs, width, bottom=jerk_costs, label='Time Cost', color='lightgreen')
+    ax5.bar(x, pos_costs, width, bottom=jerk_costs+time_costs, label='Position Cost', color='salmon')
+
+    # Add total cost values as text
+    for i, (j, t, p) in enumerate(zip(jerk_costs, time_costs, pos_costs)):
+        total = j + t + p
+        ax5.text(i, total + 0.1*total, f'{total:.1f}', ha='center', fontsize=9)
+
+    ax5.set_title("Cost Component Comparison", fontsize=10)
+    ax5.set_xticks(x)
+    ax5.set_xticklabels(labels, fontsize=10)
+    ax5.set_ylabel("Cost Value", fontsize=10)
+    ax5.legend(fontsize=10)
+
+    # Safety distance comparison
+    ax6 = plt.subplot(gs[2, 1])
+
+    # Plot the minimum required safety distance
+    req_dist = results[0][2]['required_distance'][0]  # Just use the initial required distance as reference
+    ax6.axhline(y=req_dist, color='red', linestyle='--', linewidth=2, label="Min Required Distance")
+
+    # Plot the vehicle gap for each parameter value
+    for i, ((_, _, eval_data, *_), lbl) in enumerate(zip(results, labels)):
+        # Calculate vehicle gap (distance between vehicles)
+        gap = eval_data['distances']
+
+        # Plot gaps
+        ax6.plot(t_values, gap, color=colors[i % len(colors)], linewidth=2,
+                 label=f"Gap ({lbl})")
+
+    ax6.set_title("Vehicle Gap Comparison", fontsize=10)
+    ax6.set_xlabel("Time (s)", fontsize=10)
+    ax6.set_ylabel("Distance (m)", fontsize=10)
+    ax6.grid(True, alpha=0.3)
+    ax6.legend(fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def run_parameter_sweep():
+    '''
+    Run parameter sweep to analyze the effect of weight parameters
+    '''
+    # Vehicle initial states [position, velocity, acceleration]
+    ego_car = [0, 25, 0,]      # Ego vehicle: starting at 0m with 25m/s (90km/h)  [5]
+    lead_car = [50, 20, 0]    # Lead vehicle: 50m ahead at 20m/s (72km/h)  [5]
+
+    # Planning parameters
+    T = 8                     # Time horizon of 8 seconds
+    D_0 = 10                  # Minimum standstill distance
+    tau = 1.5                 # Time headway for safety
+
+    optimizer = TrajectoryOptimizer(ego_car, lead_car, T, D_0, tau)
+    t_values = np.linspace(0, T, 100)
+
+    # Lead vehicle position at each time step
+    lead_pos = optimizer.s_lv0 + optimizer.v_lv * t_values
+
+    # Use wider parameter ranges to see more distinctive behaviors
+    k_j_values = [0.1, 1.0, 10.0, 50.0, 100.0]  # Wider range for comfort weight
+    k_t_values = [0.1, 1.0, 10.0, 50.0, 100.0]  # Wider range for time efficiency
+    k_s_values = [0.1, 1.0, 10.0, 50.0, 100.0]  # Wider range for position accuracy
+
+    # 1. Analyze the effect of k_j (jerk weight)
+    print("\n== Effect of k_j Parameter (k_t=1.0, k_s=1.0) ==")
+    k_j_results = []
+    for k_j in k_j_values:
+        k_t = 1.0
+        k_s = 1.0
+
+        #print(f"\nOptimization: k_j={k_j:.2f}, k_t={k_t:.2f}, k_s={k_s:.2f}")
+        a_opt, total_cost, jerk_cost, time_cost, position_cost = optimizer.optimize_trajectory(k_j, k_t, k_s)
+        eval_data = optimizer.evaluate_trajectory(a_opt, t_values)
+
+        k_j_results.append((k_j, a_opt, eval_data, jerk_cost, time_cost, position_cost))
+
+    plot_trajectory_comparison(
+        k_j_results, t_values,
+        label_key="k_j",
+        title_prefix="Effect of k_j (Comfort Weight)",
+        target_pos=optimizer.s_target,
+        lead_pos=lead_pos
+    )
+
+    # 2. Analyze the effect of k_t (time weight)
+    print("\n== Effect of k_t Parameter (k_j=1.0, k_s=1.0) ==")
+    k_t_results = []
+    for k_t in k_t_values:
+        k_j = 1.0
+        k_s = 1.0
+
+        #print(f"\nOptimization: k_j={k_j:.2f}, k_t={k_t:.2f}, k_s={k_s:.2f}")
+        a_opt, total_cost, jerk_cost, time_cost, position_cost = optimizer.optimize_trajectory(k_j, k_t, k_s)
+        eval_data = optimizer.evaluate_trajectory(a_opt, t_values)
+
+        k_t_results.append((k_t, a_opt, eval_data, jerk_cost, time_cost, position_cost))
+
+    plot_trajectory_comparison(
+        k_t_results, t_values,
+        label_key="k_t",
+        title_prefix="Effect of k_t (Time Weight)",
+        target_pos=optimizer.s_target,
+        lead_pos=lead_pos
+    )
+
+    # 3. Analyze the effect of k_s (position weight)
+    print("\n== Effect of k_s Parameter (k_j=1.0, k_t=1.0) ==")
+    k_s_results = []
+    for k_s in k_s_values:
+        k_j = 1.0
+        k_t = 1.0
+
+        #print(f"\nOptimization: k_j={k_j:.2f}, k_t={k_t:.2f}, k_s={k_s:.2f}")
+        a_opt, total_cost, jerk_cost, time_cost, position_cost = optimizer.optimize_trajectory(k_j, k_t, k_s)
+        eval_data = optimizer.evaluate_trajectory(a_opt, t_values)
+
+        k_s_results.append((k_s, a_opt, eval_data, jerk_cost, time_cost, position_cost))
+
+    plot_trajectory_comparison(
+        k_s_results, t_values,
+        label_key="k_s",
+        title_prefix="Effect of k_s (Position Weight)",
+        target_pos=optimizer.s_target,
+        lead_pos=lead_pos
+    )
+
+
+if __name__ == "__main__":
+    run_parameter_sweep()
+
+
+
