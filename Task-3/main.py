@@ -1,14 +1,25 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib
 
-matplotlib.use("TkAgg")
 
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib
+def _use_compatible_backend():
+    """Select an interactive Matplotlib backend that's actually available on
+    this machine (macOS often ships without Tkinter), falling back to the
+    non-interactive 'Agg' backend so the script still runs headless / in CI.
+    Set the MPLBACKEND environment variable to force a specific backend."""
+    import os, sys
+    if os.environ.get("MPLBACKEND"):
+        return  # respect an explicit user choice
+    candidates = (["MacOSX"] if sys.platform == "darwin" else []) + ["QtAgg", "TkAgg", "Agg"]
+    for backend in candidates:
+        try:
+            plt.switch_backend(backend)
+            return
+        except Exception:
+            continue
 
-matplotlib.use("TkAgg")
+
+_use_compatible_backend()
 
 
 class PathTrackingSimulator:
@@ -146,9 +157,18 @@ class PathTrackingSimulator:
         axs[1].legend()
         axs[1].grid(True)
 
-        # Lateral Error calculation and RMSE
-        e_lat_fb = np.hypot(self.X_fb - self.X_ref, self.Y_fb - self.Y_ref)
-        e_lat_pp = np.hypot(self.X_pp - self.X_ref, self.Y_pp - self.Y_ref)
+        # Lateral (cross-track) error = perpendicular distance from the vehicle
+        # to the reference path. Comparing X/Y at the same time index would mix
+        # longitudinal lag into the error; the true tracking error is the
+        # shortest distance to the path, so we take the nearest reference point.
+        def cross_track_error(X, Y):
+            e = np.empty(len(X))
+            for i in range(len(X)):
+                e[i] = np.min(np.hypot(self.X_ref - X[i], self.Y_ref - Y[i]))
+            return e
+
+        e_lat_fb = cross_track_error(self.X_fb, self.Y_fb)
+        e_lat_pp = cross_track_error(self.X_pp, self.Y_pp)
         rms_fb = np.sqrt(np.mean(e_lat_fb ** 2))
         rms_pp = np.sqrt(np.mean(e_lat_pp ** 2))
 

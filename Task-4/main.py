@@ -1,9 +1,26 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from sklearn.metrics import mean_squared_error
-import matplotlib
-matplotlib.use('TkAgg')
+
+
+def _use_compatible_backend():
+    """Select an interactive Matplotlib backend that's actually available on
+    this machine (macOS often ships without Tkinter), falling back to the
+    non-interactive 'Agg' backend so the script still runs headless / in CI.
+    Set the MPLBACKEND environment variable to force a specific backend."""
+    import os, sys
+    if os.environ.get("MPLBACKEND"):
+        return  # respect an explicit user choice
+    candidates = (["MacOSX"] if sys.platform == "darwin" else []) + ["QtAgg", "TkAgg", "Agg"]
+    for backend in candidates:
+        try:
+            plt.switch_backend(backend)
+            return
+        except Exception:
+            continue
+
+
+_use_compatible_backend()
 class SmartSpeedAssistant:
     def __init__(self, a_x_comfort=-2.0, a_y_comfort=1.5, v_init=25.0, road_length=3000, segment_length=50):
         """
@@ -124,7 +141,10 @@ class SmartSpeedAssistant:
         if v_curr <= v_lim:
             return 0  # No need to decelerate
         else:
-            return (v_curr**2 - v_lim**2) / (2 * abs(self.a_x_comfort))
+            # Guard against a_x_comfort == 0 (avoids division by zero for the
+            # "no comfort limit" edge-case scenario).
+            a_lim = max(abs(self.a_x_comfort), 1e-3)
+            return (v_curr**2 - v_lim**2) / (2 * a_lim)
     
     def desired_acceleration(self, s, v):
         """
@@ -141,21 +161,28 @@ class SmartSpeedAssistant:
         look_ahead_distance = 200  # metres to look ahead
         min_accel = 0  # Default acceleration
         
-        # Check multiple points ahead to find required deceleration
-        for distance in range(int(s), int(s + look_ahead_distance), 10):
-            if distance >= self.road_length:
+        # Check multiple points ahead to find required deceleration.
+        # Start strictly ahead of the current position so the gap (distance - s)
+        # is always positive: starting at int(s) could make it zero (division by
+        # zero) or negative (which would flip the sign and compute a phantom
+        # acceleration when deceleration is required).
+        step = 10
+        start = int(s) + step
+        for distance in range(start, int(s + look_ahead_distance) + step, step):
+            gap = distance - s
+            if distance >= self.road_length or gap <= 0:
                 continue
-                
+
             v_lim = self.speed_limit_combined(distance)
             d_trig = self.trigger_distance(v, v_lim)
-            
+
             # If we're within deceleration distance to a speed limit
-            if distance - s <= d_trig:
+            if gap <= d_trig:
                 # Calculate required acceleration to meet speed limit
                 if v > v_lim:
                     # Using basic acceleration formula: a = (v_final^2 - v_initial^2) / (2 * distance)
-                    accel = (v_lim**2 - v**2) / (2 * (distance - s))
-                    
+                    accel = (v_lim**2 - v**2) / (2 * gap)
+
                     # Get the maximum required deceleration (most negative)
                     min_accel = min(min_accel, accel)
         
@@ -242,11 +269,18 @@ class SmartSpeedAssistant:
     def compute_rmse_path_error(self, X_actual, Y_actual):
         """
         Compute RMSE between actual vehicle path and planned road geometry.
+
+        The road geometry is sampled on a uniform arc-length grid (every
+        ``segment_length`` metres), whereas the vehicle path is sampled on the
+        ODE solver's time grid. Comparing them index-by-index is meaningless,
+        so we re-sample the vehicle path onto the road's arc-length grid using
+        the travelled distance (``self.position``) before comparing.
         """
-        N = min(len(self.road_x), len(X_actual))
-        errors = np.sqrt((self.road_x[:N] - X_actual[:N])**2 + (self.road_y[:N] - Y_actual[:N])**2)
-        rmse = np.sqrt(np.mean(errors**2))
-        return rmse
+        s_road = np.linspace(0, self.road_length, len(self.road_x))
+        X_interp = np.interp(s_road, self.position, X_actual)
+        Y_interp = np.interp(s_road, self.position, Y_actual)
+        errors = np.hypot(self.road_x - X_interp, self.road_y - Y_interp)
+        return np.sqrt(np.mean(errors**2))
 
 
     def simulate(self, max_time=200):

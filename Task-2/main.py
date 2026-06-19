@@ -6,9 +6,26 @@ import matplotlib.pyplot as plt
 from scipy.integrate import quad
 from scipy.optimize import minimize
 from matplotlib.gridspec import GridSpec
-import matplotlib
 
-matplotlib.use('TkAgg')
+
+def _use_compatible_backend():
+    """Select an interactive Matplotlib backend that's actually available on
+    this machine (macOS often ships without Tkinter), falling back to the
+    non-interactive 'Agg' backend so the script still runs headless / in CI.
+    Set the MPLBACKEND environment variable to force a specific backend."""
+    import os, sys
+    if os.environ.get("MPLBACKEND"):
+        return  # respect an explicit user choice
+    candidates = (["MacOSX"] if sys.platform == "darwin" else []) + ["QtAgg", "TkAgg", "Agg"]
+    for backend in candidates:
+        try:
+            plt.switch_backend(backend)
+            return
+        except Exception:
+            continue
+
+
+_use_compatible_backend()
 
 class TrajectoryOptimizer:
     '''
@@ -81,62 +98,56 @@ class TrajectoryOptimizer:
 
         a_full =[self.s0,self.v0,self.ac0/2]+list(a_free)  #  [6] Trajectory generation
 
-        # Jerk cost
-
-        jerk_cost = self.jerk_squared_integral(a_full,0,self.T)   # jerk_cost = quad( f''(t)**2)
-
-        # Penalize jerk to avoid sharp changes
+        # Characteristic scales used to non-dimensionalise every cost term, so
+        # that k_j / k_t / k_s are the ONLY weights that decide the trade-off.
+        # (Previously the terms had mismatched units and were divided by the
+        # arbitrary constants 1.0 / 2.0 / 1000.0, which hid extra weighting.)
+        L_char = max(abs(self.s_target - self.s0), 1.0)   # characteristic length [m]
+        v_char = max(self.v_lv, 1.0)                       # characteristic speed [m/s]
+        jerk_char = L_char / self.T**3                     # characteristic jerk  [m/s^3]
+        accel_char = L_char / self.T**2                    # characteristic accel [m/s^2]
 
         t_samples = np.linspace(0,self.T,20)
+
+        # --- Jerk cost (comfort) ---
+        jerk_cost = self.jerk_squared_integral(a_full,0,self.T)   # ∫ jerk² dt  [m²/s⁵]
         jerk_values = self.generate_jerk(a_full,t_samples)
-        max_jerk_penalty = np.max(np.abs(jerk_values))**2 # The maximum absolute jerk value during early iterations is very large (around 10,000),
-        # but it decreases to around 0.5 after optimization
-        total_jerk_cost = jerk_cost + max_jerk_penalty*0.1  # I included the impact of penalization together with a rate factor, based on the output values I observed
+        max_jerk_penalty = np.max(np.abs(jerk_values))**2         # peak jerk²  [m²/s⁶]
 
-        # Time Cost
+        # Non-dimensionalise both pieces before combining (∫jerk²dt by jerk_char²·T,
+        # peak jerk² by jerk_char²) so the sum is unit-consistent.
+        norm_jerk_integral = jerk_cost / (jerk_char**2 * self.T)
+        norm_max_jerk = max_jerk_penalty / jerk_char**2
+        norm_jerk_cost = norm_jerk_integral + 0.1 * norm_max_jerk
 
+        # --- Time cost (speed tracking + smoothness) ---
         velocities = self.generate_velocity(a_full,t_samples)
-
-        # Deviation from the desired speed
-        desired_speed = self.v_lv # The lead vehicle's speed is used as the target; it could potentially be updated to maintain a safe following distance
-        speed_deviation = np.mean((velocities - desired_speed)**2)
-
-        # Acceleration cost to encourage smoother speed transitions
+        # The lead vehicle's speed is used as the target; it could potentially be
+        # updated to maintain a safe following distance.
+        desired_speed = self.v_lv
+        speed_deviation = np.mean((velocities - desired_speed)**2)   # [m²/s²]
         accelerations = self.generate_acceleration(a_full,t_samples)
-        accel_cost = np.mean(accelerations**2) # Starts around 12,000, suddenly drops from 4,000 to 14 — needs investigation??
+        accel_cost = np.mean(accelerations**2)                       # [m²/s⁴]
 
-        # Total Time Cost
-        time_efficiency_cost = speed_deviation + accel_cost *0.1  # A smaller rate can be assigned compared to jerk
+        # Each piece divided by its own characteristic scale -> dimensionless.
+        norm_time_cost = speed_deviation / v_char**2 + 0.1 * accel_cost / accel_char**2
 
-        # Position error cost
-        # Final Position
+        # --- Position cost (reach target gap + stay safe) ---
         s_T = self.generate_trajectory(a_full,self.T)
+        position_error = (s_T - self.s_target)**2                    # [m²]
 
-        # Position error with respect to the target
-        position_error = (s_T - self.s_target)**2
-
-        # Distance between the lead and ego vehicles
-        lead_pos = self.s_lv0 + self.v_lv*t_samples  # Moving with constant acceleration
+        lead_pos = self.s_lv0 + self.v_lv*t_samples  # Moving with constant velocity
         ego_pos = self.generate_trajectory(a_full,t_samples)
         distances = lead_pos - ego_pos
-
-        # Required distance for safe following
         safe_distances = self.D_0+self.tau*self.generate_velocity(a_full,t_samples)
-
-        # Penalization for violating the safe distance
         safety_violations = np.maximum(0,safe_distances-distances)
-        safety_cost = np.sum(safety_violations**2)
+        safety_cost = np.sum(safety_violations**2)                   # [m²]
+
         position_error_weight = 0.5
         safety_weight = 0.1
-        # Combined Position Cost
-        print(f"Position error: {position_error},safety_violations: {np.sum(safety_violations)}")
-        total_position_cost = position_error_weight * position_error + safety_weight * np.sum(safety_violations**2)
-
-        # SCALING  - make costs comparable
-        # Use scaling that makes effects of different parameter values more visible
-        norm_jerk_cost = total_jerk_cost /1.0
-        norm_time_cost = time_efficiency_cost/2.0
-        norm_position_cost = total_position_cost/1000.0
+        # Both pieces are lengths², normalise by L_char² -> dimensionless.
+        norm_position_cost = (position_error_weight * position_error
+                              + safety_weight * safety_cost) / L_char**2
 
         # Total Weighted Cost
 
@@ -156,17 +167,33 @@ class TrajectoryOptimizer:
         Find optimal trajectory coefficient by minimizing the cost function
         '''
         if initial_guess is None:
-            target_speed = self.s_target
-            initial_s = self.s0
-            initial_v = self.v0
-            initial_ac = self.ac0
+            # Closed-form quintic boundary-value initial guess.
+            # a0=s0, a1=v0, a2=ac0/2 are fixed; solve for a3,a4,a5 so that at
+            # t=T the trajectory reaches the target position with the lead
+            # vehicle's speed and zero acceleration. Earlier this was computed
+            # with T multiplied (instead of divided) into a4/a5, which produced
+            # huge, dimensionally-inconsistent starting coefficients.
+            T = self.T
+            s_T_target = self.s_target          # desired position at T
+            v_T_target = self.v_lv              # match lead-vehicle speed
+            a_T_target = 0.0                    # settle to zero acceleration
 
-            s_estimate = initial_s + (initial_v*self.T) + 0.5*(initial_ac*self.T**2)
-            delta_s = self.s_target - s_estimate
-            a3_init= (delta_s/self.T**3)*3
-            a4_init = (delta_s*self.T**4)*-4
-            a5_init = (delta_s*self.T**5)*-1
-            initial_guess = [a3_init,a4_init,a5_init]
+            # Contribution of the fixed (a0,a1,a2) terms evaluated at t=T.
+            c_pos = self.s0 + self.v0 * T + (self.ac0 / 2) * T**2
+            c_vel = self.v0 + self.ac0 * T
+            c_acc = self.ac0
+
+            M = np.array([
+                [T**3,     T**4,      T**5],
+                [3 * T**2, 4 * T**3,  5 * T**4],
+                [6 * T,    12 * T**2, 20 * T**3],
+            ])
+            rhs = np.array([
+                s_T_target - c_pos,
+                v_T_target - c_vel,
+                a_T_target - c_acc,
+            ])
+            initial_guess = list(np.linalg.solve(M, rhs))
 
 
         def objective(a_free):

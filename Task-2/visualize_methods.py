@@ -1,8 +1,26 @@
 import os
 import csv
 import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('TkAgg')
+
+
+def _use_compatible_backend():
+    """Select an interactive Matplotlib backend that's actually available on
+    this machine (macOS often ships without Tkinter), falling back to the
+    non-interactive 'Agg' backend so the script still runs headless / in CI.
+    Set the MPLBACKEND environment variable to force a specific backend."""
+    import sys
+    if os.environ.get("MPLBACKEND"):
+        return  # respect an explicit user choice
+    candidates = (["MacOSX"] if sys.platform == "darwin" else []) + ["QtAgg", "TkAgg", "Agg"]
+    for backend in candidates:
+        try:
+            plt.switch_backend(backend)
+            return
+        except Exception:
+            continue
+
+
+_use_compatible_backend()
 def plot_csv_log(file_path, title=None):
     iterations = []
     total_costs = []
