@@ -1,0 +1,23 @@
+{
+  "archived_on": "2026-09-18",
+  "reported_original_period": "2025-05",
+  "date_evidence": "Project owner statement; original submission timestamp not independently verified",
+  "files": [
+    {
+      "file": "assignment.pdf",
+      "original_filename": "5dcccc7010a242f585d0167af8cac80b (1).pdf",
+      "role": "assignment",
+      "size_bytes": 294243,
+      "pages": 4,
+      "sha256": "956c8d19ccbc6cb8d95f6f5d3d05e7d8e03d843aaba8abbb241026cad7bdacfb"
+    },
+    {
+      "file": "submission_report.pdf",
+      "original_filename": "ford_final_report (1).pdf",
+      "role": "submitted_report",
+      "size_bytes": 5727183,
+      "pages": 72,
+      "sha256": "d4f6a77fa618eec61ca57ec6c9467e161a2ea71584903244414cf59a1bac6192"
+    }
+  ]
+}

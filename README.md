@@ -9,6 +9,23 @@ The goal is educational: to show *how* common ADAS features work mathematically,
 how their tuning parameters affect behaviour, and where the comfort/safety
 trade-offs lie.
 
+## Project history and review status
+
+The original assignment was completed in **May 2025**, according to the author.
+It was developed through research and AI-assisted learning. The submitted report
+is the historical reference; the current `Task-*` files include later changes
+and should not be treated as an exact copy of the original submission.
+
+In **September 2026**, the assignment and submitted report were revisited.
+The [review record (Türkçe)](docs/REVIEW_2026-09.md) separates verified errors,
+method changes, and remaining limitations. The task descriptions below describe
+the existing implementation; their experimental claims are subject to that review.
+
+For the new implementation, saved results, tests, and Turkish technical report,
+start with the [independent reference solution](adas_reference_solution/README.md).
+Its models are educational and its results do not establish real-vehicle safety.
+Original-document provenance is recorded in the [archive notes](archive/2025-05/README.md).
+
 ## Tasks
 
 | Task | Topic | Key idea |

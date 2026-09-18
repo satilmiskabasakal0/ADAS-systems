@@ -1,0 +1,22 @@
+test_friction_saturation (test_models.BrakingTests.test_friction_saturation) ... ok
+test_low_friction_and_distance_identity (test_models.BrakingTests.test_low_friction_and_distance_identity) ... ok
+test_curve_and_traffic_units (test_models.SpeedTests.test_curve_and_traffic_units) ... ok
+test_exact_straight_and_arc_geometry (test_models.SpeedTests.test_exact_straight_and_arc_geometry) ... ok
+test_full_interval_constraints_and_initial_speed (test_models.SpeedTests.test_full_interval_constraints_and_initial_speed) ... ok
+test_infeasibility_is_not_silently_clipped (test_models.SpeedTests.test_infeasibility_is_not_silently_clipped) ... ok
+test_transition_limit_met (test_models.SpeedTests.test_transition_limit_met) ... ok
+test_zero_lateral_limit_cannot_traverse_curve (test_models.SpeedTests.test_zero_lateral_limit_cannot_traverse_curve) ... ok
+test_finite_path_end_does_not_reset (test_models.TrackingTests.test_finite_path_end_does_not_reset) ... ok
+test_pursuit_circle_intersection (test_models.TrackingTests.test_pursuit_circle_intersection) ... ok
+test_reference_heading_is_path_slope (test_models.TrackingTests.test_reference_heading_is_path_slope) ... ok
+test_segment_projection_not_waypoint_distance (test_models.TrackingTests.test_segment_projection_not_waypoint_distance) ... ok
+test_infeasible_selection_explicit (test_models.TrajectoryTests.test_infeasible_selection_explicit) ... ok
+test_known_minimum_jerk_solution (test_models.TrajectoryTests.test_known_minimum_jerk_solution) ... ok
+test_selected_constraints_and_finite_grid_optimality (test_models.TrajectoryTests.test_selected_constraints_and_finite_grid_optimality) ... ok
+test_six_boundary_conditions (test_models.TrajectoryTests.test_six_boundary_conditions) ... ok
+test_stationary_point_not_missed (test_models.TrajectoryTests.test_stationary_point_not_missed) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 0.815s
+
+OK
